@@ -1,6 +1,7 @@
 import os
 import sys
 
+# 将项目根目录加入模块搜索路径，方便 trainer 中导入 model / dataset / utils
 __package__ = "trainer"
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
@@ -18,27 +19,35 @@ from dataset.lm_dataset import SFTDataset
 from model.model_lora import save_lora, apply_lora
 from trainer.trainer_utils import get_lr, Logger, is_main_process, lm_checkpoint, init_distributed_mode, setup_seed, init_model, SkipBatchSampler
 
+# 屏蔽训练中的冗余 warning，让日志更干净
 warnings.filterwarnings('ignore')
 
 
 def train_epoch(epoch, loader, iters, lora_params, start_step=0, wandb=None):
-    start_time = time.time()
-    last_step = start_step
+    """只更新 LoRA 参数的监督微调单个 epoch。"""
+    start_time = time.time()  # 记录起始时间，用于 ETA 估计
+    last_step = start_step  # 记录最后一个 step，便于尾部补一次更新
+
     for step, (input_ids, labels) in enumerate(loader, start=start_step + 1):
-        input_ids = input_ids.to(args.device)
-        labels = labels.to(args.device)
+        input_ids = input_ids.to(args.device)  # 输入 token 放到目标设备
+        labels = labels.to(args.device)  # 标签同步放到目标设备
         last_step = step
+
+        # 按全局 step 计算学习率，保证 scheduler 风格一致
         lr = get_lr(epoch * iters + step, args.epochs * iters, args.learning_rate)
         for param_group in optimizer.param_groups:
             param_group['lr'] = lr
 
+        # ===== 前向传播 =====
         with autocast_ctx:
             res = model(input_ids, labels=labels)
-            loss = res.loss + res.aux_loss
+            loss = res.loss + res.aux_loss  # 主损失 + 可选 MoE 辅助损失
             loss = loss / args.accumulation_steps
 
+        # AMP 反传
         scaler.scale(loss).backward()
 
+        # 梯度累积达到阈值后，只对 LoRA 参数做裁剪和更新
         if step % args.accumulation_steps == 0:
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(lora_params, args.grad_clip)
@@ -46,6 +55,7 @@ def train_epoch(epoch, loader, iters, lora_params, start_step=0, wandb=None):
             scaler.update()
             optimizer.zero_grad(set_to_none=True)
 
+        # ===== 日志输出 =====
         if step % args.log_interval == 0 or step == iters:
             spend_time = time.time() - start_time
             current_loss = loss.item() * args.accumulation_steps
@@ -54,19 +64,23 @@ def train_epoch(epoch, loader, iters, lora_params, start_step=0, wandb=None):
             current_lr = optimizer.param_groups[-1]['lr']
             eta_min = spend_time / max(step - start_step, 1) * (iters - step) // 60
             Logger(f'Epoch:[{epoch + 1}/{args.epochs}]({step}/{iters}), loss: {current_loss:.4f}, logits_loss: {current_logits_loss:.4f}, aux_loss: {current_aux_loss:.4f}, lr: {current_lr:.8f}, epoch_time: {eta_min:.1f}min')
-            if wandb: wandb.log({"loss": current_loss, "logits_loss": current_logits_loss, "aux_loss": current_aux_loss, "learning_rate": current_lr, "epoch_time": eta_min})
+            if wandb:
+                wandb.log({"loss": current_loss, "logits_loss": current_logits_loss, "aux_loss": current_aux_loss, "learning_rate": current_lr, "epoch_time": eta_min})
 
+        # ===== 保存 checkpoint =====
         if (step % args.save_interval == 0 or step == iters) and is_main_process():
             model.eval()
             moe_suffix = '_moe' if lm_config.use_moe else ''
             lora_save_path = f'{args.save_dir}/{args.lora_name}_{lm_config.hidden_size}{moe_suffix}.pth'
-            # LoRA只保存LoRA权重
+            # LoRA 只保存增量权重，不保存完整主干权重
             save_lora(model, lora_save_path)
             lm_checkpoint(lm_config, weight=args.lora_name, model=model, optimizer=optimizer, scaler=scaler, epoch=epoch, step=step, wandb=wandb, save_dir='../checkpoints')
             model.train()
 
+        # 释放本步的临时变量，减少显存驻留
         del input_ids, labels, res, loss
 
+    # 如果最后一个 batch 没有触发累积更新，这里补一次
     if last_step > start_step and last_step % args.accumulation_steps != 0:
         scaler.unscale_(optimizer)
         torch.nn.utils.clip_grad_norm_(lora_params, args.grad_clip)
@@ -74,7 +88,9 @@ def train_epoch(epoch, loader, iters, lora_params, start_step=0, wandb=None):
         scaler.update()
         optimizer.zero_grad(set_to_none=True)
 
+
 if __name__ == "__main__":
+    # LoRA 微调入口：加载主干模型后注入 LoRA 层，只训练少量可学习参数
     parser = argparse.ArgumentParser(description="MiniMind LoRA Fine-tuning")
     parser.add_argument("--save_dir", type=str, default="../out", help="模型保存目录")
     parser.add_argument("--lora_name", type=str, default="lora_medical", help="LoRA权重名称(如lora_identity/lora_medical等)")
@@ -102,20 +118,21 @@ if __name__ == "__main__":
 
     # ========== 1. 初始化环境和随机种子 ==========
     local_rank = init_distributed_mode()
-    if dist.is_initialized(): args.device = f"cuda:{local_rank}"
+    if dist.is_initialized():
+        args.device = f"cuda:{local_rank}"
     setup_seed(42 + (dist.get_rank() if dist.is_initialized() else 0))
-    
+
     # ========== 2. 配置目录、模型参数、检查ckp ==========
     os.makedirs(args.save_dir, exist_ok=True)
     lm_config = MiniMindConfig(hidden_size=args.hidden_size, num_hidden_layers=args.num_hidden_layers, use_moe=bool(args.use_moe))
-    ckp_data = lm_checkpoint(lm_config, weight=args.lora_name, save_dir='../checkpoints') if args.from_resume==1 else None
-    
+    ckp_data = lm_checkpoint(lm_config, weight=args.lora_name, save_dir='../checkpoints') if args.from_resume == 1 else None
+
     # ========== 3. 设置混合精度 ==========
     device_type = "cuda" if "cuda" in args.device else "cpu"
     dtype = torch.bfloat16 if args.dtype == "bfloat16" else torch.float16
     autocast_ctx = nullcontext() if device_type == "cpu" else torch.cuda.amp.autocast(dtype=dtype)
-    
-    # ========== 4. 配wandb ==========
+
+    # ========== 4. 配 wandb ==========
     wandb = None
     if args.use_wandb and is_main_process():
         import swanlab as wandb
@@ -123,19 +140,19 @@ if __name__ == "__main__":
         resume = 'must' if wandb_id else None
         wandb_run_name = f"MiniMind-LoRA-{args.lora_name}-Epoch-{args.epochs}-BatchSize-{args.batch_size}-LR-{args.learning_rate}"
         wandb.init(project=args.wandb_project, name=wandb_run_name, id=wandb_id, resume=resume)
-    
-    # ========== 5. 定义模型、应用LoRA、冻结非LoRA参数 ==========
+
+    # ========== 5. 定义模型、应用 LoRA、冻结非 LoRA 参数 ==========
     model, tokenizer = init_model(lm_config, args.from_weight, device=args.device)
     apply_lora(model)
-    
-    # 统计参数
+
+    # 统计总参数和 LoRA 参数占比，帮助确认 PEFT 的规模优势
     total_params = sum(p.numel() for p in model.parameters())
     lora_params_count = sum(p.numel() for name, p in model.named_parameters() if 'lora' in name)
     Logger(f"LLM 总参数量: {total_params / 1e6:.3f} M")
     Logger(f"LoRA 参数量: {lora_params_count / 1e6:.3f} M")
     Logger(f"LoRA 参数占比: {lora_params_count / total_params * 100:.2f}%")
-    
-    # 冻结非LoRA参数，收集LoRA参数
+
+    # 只保留 LoRA 参数可训练，其它参数全部冻结
     lora_params = []
     for name, param in model.named_parameters():
         if 'lora' in name:
@@ -143,14 +160,14 @@ if __name__ == "__main__":
             lora_params.append(param)
         else:
             param.requires_grad = False
-    
+
     # ========== 6. 定义数据和优化器 ==========
     train_ds = SFTDataset(args.data_path, tokenizer, max_length=args.max_seq_len)
     train_sampler = DistributedSampler(train_ds) if dist.is_initialized() else None
     scaler = torch.cuda.amp.GradScaler(enabled=(args.dtype == 'float16'))
     optimizer = optim.AdamW(lora_params, lr=args.learning_rate)
-    
-    # ========== 7. 从ckp恢复状态 ==========
+
+    # ========== 7. 从 ckp 恢复状态 ==========
     start_epoch, start_step = 0, 0
     if ckp_data:
         model.load_state_dict(ckp_data['model'], strict=False)
@@ -158,26 +175,29 @@ if __name__ == "__main__":
         scaler.load_state_dict(ckp_data['scaler'])
         start_epoch = ckp_data['epoch']
         start_step = ckp_data.get('step', 0)
-    
+
     # ========== 8. 编译和分布式包装 ==========
     if args.use_compile == 1:
+        # LoRA 的 monkey patch forward 不适配 torch.compile，因此自动关闭
         args.use_compile = 0
         Logger('[LoRA] monkey-patch forward 与 torch.compile 不兼容，use_compile 已自动关闭')
     if dist.is_initialized():
         model = DistributedDataParallel(model, device_ids=[local_rank])
-    
+
     # ========== 9. 开始训练 ==========
     for epoch in range(start_epoch, args.epochs):
         train_sampler and train_sampler.set_epoch(epoch)
-        setup_seed(42 + epoch); indices = torch.randperm(len(train_ds)).tolist()
+        setup_seed(42 + epoch)
+        indices = torch.randperm(len(train_ds)).tolist()
         skip = start_step if (epoch == start_epoch and start_step > 0) else 0
         batch_sampler = SkipBatchSampler(train_sampler or indices, args.batch_size, skip)
         loader = DataLoader(train_ds, batch_sampler=batch_sampler, num_workers=args.num_workers, pin_memory=True)
-        if skip > 0: 
+        if skip > 0:
             Logger(f'Epoch [{epoch + 1}/{args.epochs}]: 跳过前{start_step}个step，从step {start_step + 1}开始')
             train_epoch(epoch, loader, len(loader) + skip, lora_params, start_step, wandb)
         else:
             train_epoch(epoch, loader, len(loader), lora_params, 0, wandb)
-    
+
     # ========== 10. 清理分布进程 ==========
-    if dist.is_initialized(): dist.destroy_process_group()
+    if dist.is_initialized():
+        dist.destroy_process_group()

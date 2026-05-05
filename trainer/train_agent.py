@@ -1,6 +1,7 @@
 import os
 import sys
 
+# 将当前目录视为 trainer 包，并确保可以从项目根目录导入 model / dataset
 __package__ = "trainer"
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
@@ -26,16 +27,21 @@ from dataset.lm_dataset import AgentRLDataset
 from trainer.trainer_utils import Logger, is_main_process, lm_checkpoint, init_distributed_mode, setup_seed, SkipBatchSampler, init_model, LMForRewardModel
 from trainer.rollout_engine import create_rollout_engine, compute_per_token_logps
 
+# 屏蔽训练过程里常见但不重要的 warning，减少日志噪声
 warnings.filterwarnings('ignore')
 
 # ================================ 工具与 Reward = Start ================================
 
+
 def rep_penalty(text, n=3, cap=0.5):
-    toks = re.findall(r"\w+|[^\w\s]", text.lower())
-    grams = [tuple(toks[i:i + n]) for i in range(len(toks) - n + 1)]
+    """计算重复 n-gram 惩罚，用于避免生成内容反复复读。"""
+    toks = re.findall(r"\w+|[^\w\s]", text.lower())  # 先把文本拆成词和标点
+    grams = [tuple(toks[i:i + n]) for i in range(len(toks) - n + 1)]  # 构造所有 n-gram
     return min(cap, (len(grams) - len(set(grams))) * cap * 2 / len(grams)) if grams else 0.0
 
+
 # ======== 工具定义 ========
+# 这部分描述了 agent 训练时允许调用的“外部工具”schema。
 TOOLS = [
     {"type": "function", "function": {"name": "calculate_math", "description": "计算数学表达式", "parameters": {"type": "object", "properties": {"expression": {"type": "string"}}, "required": ["expression"]}}},
     {"type": "function", "function": {"name": "unit_converter", "description": "单位换算", "parameters": {"type": "object", "properties": {"value": {"type": "number"}, "from_unit": {"type": "string"}, "to_unit": {"type": "string"}}, "required": ["value", "from_unit", "to_unit"]}}},
@@ -45,14 +51,18 @@ TOOLS = [
     {"type": "function", "function": {"name": "translate_text", "description": "翻译文本", "parameters": {"type": "object", "properties": {"text": {"type": "string"}, "target_language": {"type": "string"}}, "required": ["text", "target_language"]}}},
 ]
 
+
 # ======== 模拟数据 ========
+# 这些是 toy environment 的固定答案表，用来构造可重复的工具调用奖励。
 WEATHER_DATA = {"北京": ("28°C", "晴"), "上海": ("15°C", "多云"), "广州": ("32°C", "闷热"), "深圳": ("30°C", "晴"), "杭州": ("22°C", "阴"), "成都": ("18°C", "小雨"), "武汉": ("25°C", "多云"), "南京": ("20°C", "晴"), "西安": ("16°C", "大风"), "重庆": ("26°C", "阴"), "Tokyo": ("12°C", "晴"), "New York": ("8°C", "多云"), "London": ("5°C", "小雨"), "Paris": ("10°C", "阴"), "Sydney": ("25°C", "晴朗")}
 TIME_DATA = {"Asia/Shanghai": "2025-03-07 14:30:00", "America/New_York": "2025-03-07 01:30:00", "Europe/London": "2025-03-07 06:30:00", "Asia/Tokyo": "2025-03-07 15:30:00", "Europe/Paris": "2025-03-07 07:30:00", "Australia/Sydney": "2025-03-07 17:30:00"}
 EXCHANGE_DATA = {("USD", "CNY"): 7.21, ("EUR", "CNY"): 7.85, ("GBP", "CNY"): 9.12, ("JPY", "CNY"): 0.048, ("USD", "EUR"): 0.92, ("USD", "GBP"): 0.79, ("CNY", "JPY"): 20.83, ("AUD", "CNY"): 4.72}
 TRANSLATE_DATA = {("你好世界", "english"): "Hello World", ("Good morning", "chinese"): "早上好", ("今天天气真好", "english"): "The weather is nice today", ("I love programming", "chinese"): "我喜欢编程", ("机器学习很有趣", "english"): "Machine learning is interesting", ("Happy birthday", "chinese"): "生日快乐"}
 UNIT_DATA = {"km_miles": 0.621371, "miles_km": 1.60934, "kg_pounds": 2.20462, "pounds_kg": 0.453592, "meters_feet": 3.28084, "feet_meters": 0.3048, "celsius_fahrenheit": 1.8, "fahrenheit_celsius": 0.5556}
 
+
 # ======== 模拟执行 ========
+# 这里把每个工具名映射到一个本地模拟函数，避免训练时依赖真实外部服务。
 MOCK_RESULTS = {
     "calculate_math": lambda args: {"result": str(eval(str(args.get("expression", "0")).replace("^", "**").replace("×", "*").replace("÷", "/").replace("−", "-").replace("（", "(").replace("）", ")"), {"__builtins__": {}, "math": math}))},
     "unit_converter": lambda args: {"result": round(float(args.get("value", 0)) * UNIT_DATA.get(f"{args.get('from_unit', '').lower()}_{args.get('to_unit', '').lower()}", 1), 4)},
@@ -62,7 +72,9 @@ MOCK_RESULTS = {
     "translate_text": lambda args: {"translated_text": TRANSLATE_DATA.get((args.get("text"), args.get("target_language")), args.get("text", ""))},
 }
 
+
 # ======== 参数校验 ========
+# 每个工具都有自己的参数合法性检查，奖励函数会据此判断 tool_call 是否有效。
 CHECK_ARGS = {
     "calculate_math": lambda a: bool(a.get("expression")),
     "unit_converter": lambda a: a.get("value") is not None and a.get("from_unit") and a.get("to_unit"),
@@ -72,17 +84,24 @@ CHECK_ARGS = {
     "translate_text": lambda a: bool(a.get("text")) and bool(a.get("target_language")),
 }
 
+
 # ======== 工具调用解析与执行 ========
 def parse_tool_calls(text):
+    """从模型输出中解析 <tool_call>...</tool_call> 结构。"""
     calls = []
     for m in re.findall(r'<tool_call>(.*?)</tool_call>', text, re.DOTALL):
-        try: calls.append(json.loads(m.strip()))
-        except: pass
+        try:
+            calls.append(json.loads(m.strip()))
+        except:
+            pass
     return calls
 
+
 def execute_tool(name, args):
+    """执行一个模拟工具；这里加了超时保护，避免异常工具调用卡住训练。"""
     fn = MOCK_RESULTS.get(name)
-    if not fn: return None
+    if not fn:
+        return None
     try:
         signal.signal(signal.SIGALRM, lambda *_: (_ for _ in ()).throw(TimeoutError()))
         signal.alarm(1)
@@ -90,25 +109,42 @@ def execute_tool(name, args):
     except:
         return None
     finally:
-        try: signal.alarm(0)
-        except: pass
+        try:
+            signal.alarm(0)
+        except:
+            pass
+
 
 # ======== 多轮 Rollout ========
 def rollout_single(rollout_engine, tokenizer, messages, tools, max_turns=3, max_new_tokens=256, thinking_ratio=0.5, device="cuda"):
-    all_outputs = []
-    prompt_ids = None
-    response_ids = []
-    response_mask = []
-    response_old_logps = []
-    final_context = ""
-    unfinished = False
-    open_thinking = random.random() < thinking_ratio
+    """对单个样本执行多轮对话式 rollout。
+
+    输出中会同时记录：
+    - 模型生成的文本
+    - prompt / response 的 token id
+    - response 对应的旧 logprob
+    - 是否在最大轮次内仍未完成
+    """
+    all_outputs = []  # 每轮模型原始输出
+    prompt_ids = None  # 首轮 prompt token id
+    response_ids = []  # 所有 response token id
+    response_mask = []  # response 中哪些 token 属于模型输出，哪些属于观察上下文
+    response_old_logps = []  # rollout 时记录的旧策略 logprob
+    final_context = ""  # 最终用于回放的完整上下文
+    unfinished = False  # 标记是否因为达到最大轮次而截断
+    open_thinking = random.random() < thinking_ratio  # 以概率开启 thinking 格式
+
     for turn in range(max_turns):
+        # 根据当前 messages 和 tools 构造 chat template 输入
         context = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True, tools=tools, open_thinking=open_thinking)
         inputs = tokenizer(context, return_tensors="pt", add_special_tokens=False).to(device)
         context_ids = inputs["input_ids"][0].tolist()
+
+        # 第一次进入时记录 prompt 长度，后续保持不变
         if prompt_ids is None:
             prompt_ids = context_ids
+
+        # 让 rollout engine 采样一个回答
         rollout_result = rollout_engine.rollout(
             prompt_ids=inputs["input_ids"],
             attention_mask=inputs["attention_mask"],
@@ -116,32 +152,48 @@ def rollout_single(rollout_engine, tokenizer, messages, tools, max_turns=3, max_
             max_new_tokens=max_new_tokens,
             temperature=0.8,
         )
+
+        # 取出本轮生成的 completion 和 token-level logprob
         new_ids = rollout_result.completion_ids[0].tolist()
         new_logps = rollout_result.per_token_logps[0].tolist()
-        if len(new_ids) != len(new_logps): Logger(f"rollout token/logprob length mismatch: {len(new_ids)} vs {len(new_logps)}")
+        if len(new_ids) != len(new_logps):
+            Logger(f"rollout token/logprob length mismatch: {len(new_ids)} vs {len(new_logps)}")
+
+        # 去掉 pad / eos，只保留真正的生成 token
         pairs = [(t, lp) for t, lp in zip(new_ids, new_logps) if t != tokenizer.pad_token_id and t != tokenizer.eos_token_id]
         new_ids = [t for t, _ in pairs]
         new_logps = [lp for _, lp in pairs]
         new_text = rollout_result.completions[0]
+
+        # 保存本轮输出，并把 token 级信息拼到 response 里
         all_outputs.append(new_text)
         response_ids.extend(new_ids)
         response_mask.extend([1] * len(new_ids))
         response_old_logps.extend(new_logps)
         final_context = context + new_text
+
+        # 解析输出里的工具调用，如果没有工具调用则结束这一轮对话
         calls = parse_tool_calls(new_text)
         if not calls:
             break
+
+        # 如果仍有工具调用，说明这轮没有完全结束
         unfinished = turn == max_turns - 1
         messages.append({"role": "assistant", "content": new_text})
+
+        # 执行每个工具调用，并把结果作为 tool 消息插回上下文
         for call in calls:
             name, raw = call.get("name", ""), call.get("arguments", {})
             if isinstance(raw, str):
-                try: raw = json.loads(raw)
-                except: raw = {}
+                try:
+                    raw = json.loads(raw)
+                except:
+                    raw = {}
             result = execute_tool(name, raw)
             result_str = (json.dumps(result, ensure_ascii=False) if result else '{"error": "tool not found"}')[:2048]  # 防止天文数字撑爆tokenizer
             messages.append({"role": "tool", "content": result_str})
 
+        # 工具结果回填后，再次构造上下文，供下一轮生成继续接力
         observe_context = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=not unfinished, tools=tools, open_thinking=open_thinking)
         observe_ids = tokenizer(observe_context, return_tensors="pt", add_special_tokens=False)["input_ids"][0].tolist()
         current_len = len(prompt_ids) + len(response_ids)
@@ -155,7 +207,9 @@ def rollout_single(rollout_engine, tokenizer, messages, tools, max_turns=3, max_
     prompt_ids = prompt_ids or []
     return final_output, final_context, prompt_ids, response_ids, response_mask, response_old_logps, list(all_outputs), unfinished
 
+
 def rollout_batch(rollout_engine, tokenizer, messages_batch, tools_batch, num_gen, max_turns=3, max_new_tokens=256, thinking_ratio=0.5, device="cuda"):
+    """对一个 batch 的样本逐个执行 rollout，并对每个样本生成 num_gen 条候选。"""
     all_completions = []
     all_contexts = []
     all_prompt_ids = []
@@ -164,10 +218,14 @@ def rollout_batch(rollout_engine, tokenizer, messages_batch, tools_batch, num_ge
     all_response_old_logps = []
     all_turn_outputs = []
     all_unfinished = []
+
     for messages, tools in zip(messages_batch, tools_batch):
         for _ in range(num_gen):
+            # 拷贝一份 messages，避免不同候选之间相互污染
             msgs_copy = [dict(m) for m in messages]
-            completion, context, prompt_ids, response_ids, response_mask, response_old_logps, turn_outputs, unfinished = rollout_single(rollout_engine, tokenizer, msgs_copy, tools, max_turns, max_new_tokens, thinking_ratio, device)
+            completion, context, prompt_ids, response_ids, response_mask, response_old_logps, turn_outputs, unfinished = rollout_single(
+                rollout_engine, tokenizer, msgs_copy, tools, max_turns, max_new_tokens, thinking_ratio, device
+            )
             all_completions.append(completion)
             all_contexts.append(context)
             all_prompt_ids.append(prompt_ids)
@@ -176,28 +234,42 @@ def rollout_batch(rollout_engine, tokenizer, messages_batch, tools_batch, num_ge
             all_response_old_logps.append(response_old_logps)
             all_turn_outputs.append(turn_outputs)
             all_unfinished.append(unfinished)
+
     return all_completions, all_contexts, all_prompt_ids, all_response_ids, all_response_masks, all_response_old_logps, all_turn_outputs, all_unfinished
+
 
 # ======== Reward 计算 ========
 def validate_gt_in_text(text, gt_list):
+    """检查文本中是否包含 ground truth 内容，支持数字近似匹配。"""
     text, text_num = str(text), str(text).replace(',', '')
     nums = [float(x) for x in re.findall(r'(?<![\w.])[-+]?\d+(?:\.\d+)?(?![\w.])', text_num)]
     return {g for g in gt_list if ((s := str(g).strip()) and s.lower() in text.lower()) or (re.fullmatch(r'[-+]?\d+(?:\.\d+)?', str(g).strip().replace(',', '')) and any(abs(float(str(g).strip().replace(',', '')) - n) < 1e-6 for n in nums))}
 
+
 def calculate_rewards(prompts, completions, gt_batch, tools_batch, num_gen, reward_model=None, device="cuda", turn_outputs_batch=None, unfinished_batch=None):
-    rewards = torch.zeros(len(completions), device=device)
+    """根据格式、工具调用、GT 匹配和 reward model 计算每条 completion 的最终奖励。"""
+    rewards = torch.zeros(len(completions), device=device)  # 每个样本一个 reward
+
     for idx, response in enumerate(completions):
         reward, answer = 0.0, response
-        sample_idx = idx // num_gen
+        sample_idx = idx // num_gen  # 当前 completion 属于哪一个原始 prompt
         tools = tools_batch[sample_idx]
         turn_outputs = turn_outputs_batch[idx] if turn_outputs_batch is not None else [response]
         unfinished = unfinished_batch[idx] if unfinished_batch is not None else False
+
+        # 把每轮 answer 的 <think> 部分拆掉，保留最终回答部分
         turn_answers = [turn.split('</think>', 1)[-1].strip() if '</think>' in turn else turn.strip() for turn in turn_outputs]
         answer = turn_answers[-1] if turn_answers else response.strip()
         valid_names = {t['function']['name'] for t in tools} if tools else set()
+
+        # 解析所有轮次中出现的工具调用
         tool_calls = []
-        for turn_answer in turn_answers: tool_calls.extend(parse_tool_calls(turn_answer))  # 解析tool调用
+        for turn_answer in turn_answers:
+            tool_calls.extend(parse_tool_calls(turn_answer))  # 解析tool调用
+
+        # 对标签不闭合的 tool_call / /tool_call 结构做扣分
         reward -= 0.5 * sum(abs(turn.count('<tool_call>') - turn.count('</tool_call>')) for turn in turn_answers)  # 标签扣分
+
         # -------- 无工具调用：格式+reward奖励 --------
         if not tool_calls:
             reward += 0.5 if 5 <= len(response.strip()) <= 800 else -0.5  # 长度分
@@ -206,6 +278,8 @@ def calculate_rewards(prompts, completions, gt_batch, tools_batch, num_gen, rewa
                 reward += 1.0 if 20 <= len(think.strip()) <= 300 else -0.5  # 思考长度分
                 reward += 0.25 if response.count('</think>') == 1 else -0.25  # 思考闭合分
                 answer = answer.strip()
+
+            # 如果配置了 reward model，则把对话上下文和最终回答送入 RM 评分
             if reward_model is not None:
                 prompt = prompts[sample_idx]
                 pattern = r"<\|im_start\|>(system|user|assistant)\s+(.*?)<\|im_end\|>"
@@ -213,44 +287,74 @@ def calculate_rewards(prompts, completions, gt_batch, tools_batch, num_gen, rewa
                 messages = [{"role": role, "content": content.strip()} for role, content in matches]
                 score = reward_model.get_score(messages, answer)
                 reward += score  # RM分
+
             reward -= rep_penalty(answer)
             rewards[idx] = max(min(reward, 3.0), -3.0)  # 总分Clip
+
         # -------- 有工具调用：执行结果奖励 --------
         else:
             gt = gt_batch[sample_idx]
             valid_call_count = 0
+
+            # 工具名和参数都合法时，才算一次有效工具调用
             for tool_call in tool_calls:
                 name, raw = tool_call.get("name", ""), tool_call.get("arguments", {})
                 if isinstance(raw, str):
-                    try: raw = json.loads(raw)
-                    except: raw = {}
+                    try:
+                        raw = json.loads(raw)
+                    except:
+                        raw = {}
                 check = CHECK_ARGS.get(name)
                 valid_call_count += int(bool(name in valid_names and check and check(raw)))
+
+            # tool 数量与 GT 期望之间的差距越大，惩罚越大
             tool_gap = abs(valid_call_count - len(gt)) + max(0, len(tool_calls) - valid_call_count)  # tool数差值
             reward += 0.5 if tool_gap == 0 else -0.5 * tool_gap  # tool对齐分
-            
+
+            # 如果还没结束，就不对最终文本做过强约束
             final_text = "" if unfinished else (answer.split('</tool_call>')[-1] if '</tool_call>' in answer else answer)
             verified = validate_gt_in_text(final_text, gt) if gt else set()
-            if gt: reward += 2.5 * len(verified) / len(gt)  # GT分
-            if unfinished: reward -= 0.5  # 未完成扣分
+            if gt:
+                reward += 2.5 * len(verified) / len(gt)  # GT分
+            if unfinished:
+                reward -= 0.5  # 未完成扣分
             reward -= rep_penalty(final_text if final_text else answer)
             rewards[idx] = max(min(reward, 3.0), -3.0)  # 总分Clip
+
     return rewards
+
 
 # ================================ 工具与 Reward = End ================================
 def rl_train_epoch(epoch, loader, iters, rollout_engine, ref_model, reward_model=None, start_step=0, wandb=None, use_sglang=False):
+    """单个 epoch 的强化学习训练主循环。"""
     last_step = start_step
+
     for step, batch in enumerate(loader, start=start_step + 1):
+        # 从 batch 中取出对话消息、工具和 GT
         messages_batch = batch['messages']
         tools_batch = batch['tools']
         gt_batch = batch['gt']
         last_step = step
 
+        # rollout 阶段不需要梯度
         with torch.no_grad():
-            completions, contexts, prompt_ids_batch, response_ids_batch, response_masks_batch, response_old_logps_batch, turn_outputs_batch, unfinished_batch = rollout_batch(rollout_engine, tokenizer, messages_batch, tools_batch, args.num_generations, max_turns=3, max_new_tokens=args.max_gen_len, thinking_ratio=args.thinking_ratio, device=args.device)
+            completions, contexts, prompt_ids_batch, response_ids_batch, response_masks_batch, response_old_logps_batch, turn_outputs_batch, unfinished_batch = rollout_batch(
+                rollout_engine,
+                tokenizer,
+                messages_batch,
+                tools_batch,
+                args.num_generations,
+                max_turns=3,
+                max_new_tokens=args.max_gen_len,
+                thinking_ratio=args.thinking_ratio,
+                device=args.device,
+            )
 
+        # 为每个样本还原 prompt 文本，便于后续 reward_model 读取
         prompts = [tokenizer.apply_chat_template(m, tokenize=False, add_generation_prompt=True, tools=t) for m, t in zip(messages_batch, tools_batch)]
         packed_samples = []
+
+        # 将 prompt / response 拼接，并控制最终长度不超过 max_total_len
         for p, r, m, old_lp in zip(prompt_ids_batch, response_ids_batch, response_masks_batch, response_old_logps_batch):
             ids = p + r
             mask = [0] * len(p) + m
@@ -261,6 +365,8 @@ def rl_train_epoch(epoch, loader, iters, rollout_engine, ref_model, reward_model
                 old_logps = old_logps[-(len(ids) - 1):]
             prompt_len = next((i for i, v in enumerate(mask) if v == 1), len(mask))
             packed_samples.append((ids, mask, prompt_len, old_logps))
+
+        # 将变长样本 pad 到同一长度，方便一次性送入模型
         seq_lens = torch.tensor([len(ids) for ids, _, _, _ in packed_samples], device=args.device)
         max_len = seq_lens.max().item()
         input_ids = torch.tensor([ids + [tokenizer.pad_token_id] * (max_len - len(ids)) for ids, _, _, _ in packed_samples], device=args.device)
@@ -269,6 +375,7 @@ def rl_train_epoch(epoch, loader, iters, rollout_engine, ref_model, reward_model
         old_per_token_logps = torch.tensor([old_logps + [0.0] * ((max_len - 1) - len(old_logps)) for _, _, _, old_logps in packed_samples], device=args.device, dtype=torch.float32)
         full_mask = (input_ids != tokenizer.pad_token_id).long()
 
+        # 当前策略模型前向，获取新策略的 token logprob 和 MoE 辅助损失
         model_unwrapped = model.module if isinstance(model, DistributedDataParallel) else model
         with autocast_ctx:
             res = model_unwrapped(input_ids, attention_mask=full_mask)
@@ -276,9 +383,11 @@ def rl_train_epoch(epoch, loader, iters, rollout_engine, ref_model, reward_model
             logits = res.logits[:, :-1, :]
             per_token_logps = F.log_softmax(logits, dim=-1).gather(2, input_ids[:, 1:].unsqueeze(-1)).squeeze(-1)
 
+        # 参考策略 logprob，用于 KL 约束
         with torch.no_grad():
             ref_per_token_logps = compute_per_token_logps(ref_model, input_ids, input_ids.size(1) - 1, attention_mask=full_mask)
 
+        # 只对 completion 区域计算损失，不对 prompt 区域计入
         completion_mask = full_response_masks[:, 1:]
         is_eos = (input_ids[:, 1:] == tokenizer.eos_token_id) & completion_mask.bool()
         eos_idx = torch.full((completion_mask.size(0),), completion_mask.size(1) - 1, device=args.device, dtype=torch.long)
@@ -288,8 +397,21 @@ def rl_train_epoch(epoch, loader, iters, rollout_engine, ref_model, reward_model
         completion_mask = completion_mask * (pos <= eos_idx.unsqueeze(1)).float()
         token_counts = completion_mask.sum(dim=1)
         valid_rows = token_counts > 0
-        rewards = calculate_rewards(prompts, completions, gt_batch, tools_batch, args.num_generations, reward_model, device=args.device, turn_outputs_batch=turn_outputs_batch, unfinished_batch=unfinished_batch)
 
+        # 用规则 + RM 计算 reward
+        rewards = calculate_rewards(
+            prompts,
+            completions,
+            gt_batch,
+            tools_batch,
+            args.num_generations,
+            reward_model,
+            device=args.device,
+            turn_outputs_batch=turn_outputs_batch,
+            unfinished_batch=unfinished_batch,
+        )
+
+        # 调试模式下打印更详细的样本级信息，便于定位 reward / token 对齐问题
         if args.debug_mode and is_main_process() and step % args.debug_interval == 0:
             for i in range(len(messages_batch)):
                 Logger(f"[DEBUG] step={step}, gt[{i}]: {repr(gt_batch[i])}")
@@ -309,14 +431,18 @@ def rl_train_epoch(epoch, loader, iters, rollout_engine, ref_model, reward_model
                     Logger(f"[DEBUG] gen[{i}][{j}] reward={rewards[idx].item():.4f}")
                     Logger('='*100)
 
+        # GRPO / CISPO 需要按每个 prompt 的多条采样结果做组内归一化
         grouped_rewards = rewards.view(-1, args.num_generations)
         mean_r = grouped_rewards.mean(dim=1).repeat_interleave(args.num_generations)
         std_r = grouped_rewards.std(dim=1, unbiased=False).repeat_interleave(args.num_generations)
         advantages = (rewards - mean_r) / (std_r + 1e-4)
 
+        # KL 与策略比率相关的损失项
         kl_div = ref_per_token_logps - per_token_logps
         per_token_kl = torch.exp(kl_div) - kl_div - 1
         ratio = torch.exp(per_token_logps - old_per_token_logps)
+
+        # 根据 loss_type 选择不同的策略梯度目标
         if args.loss_type == "cispo":
             clamped_ratio = torch.clamp(ratio, max=args.epsilon_high).detach()
             per_token_loss = -(clamped_ratio * advantages.unsqueeze(1) * per_token_logps - args.beta * per_token_kl)
@@ -325,15 +451,22 @@ def rl_train_epoch(epoch, loader, iters, rollout_engine, ref_model, reward_model
             per_token_loss1 = ratio * advantages.unsqueeze(1)
             per_token_loss2 = clipped_ratio * advantages.unsqueeze(1)
             per_token_loss = -(torch.min(per_token_loss1, per_token_loss2) - args.beta * per_token_kl)
+
+        # 只在有效 completion token 上计算平均 loss
         policy_loss = (((per_token_loss * completion_mask).sum(dim=1)[valid_rows] / token_counts[valid_rows].clamp(min=1)).mean()
                        if valid_rows.any() else per_token_loss.sum() * 0.0)
         loss = (policy_loss + aux_loss) / args.accumulation_steps
         loss.backward()
 
+        # 梯度累积：每 accumulation_steps 步更新一次参数
         if step % args.accumulation_steps == 0:
-            if args.grad_clip > 0: torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
-            optimizer.step(); scheduler.step(); optimizer.zero_grad()
+            if args.grad_clip > 0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+            optimizer.step()
+            scheduler.step()
+            optimizer.zero_grad()
 
+        # 日志记录：把一些关键指标打印出来并同步到 wandb
         if step % args.log_interval == 0 or step == iters:
             pl = loss.item() * args.accumulation_steps
             ar = rewards.mean().item()
@@ -346,6 +479,7 @@ def rl_train_epoch(epoch, loader, iters, rollout_engine, ref_model, reward_model
             if wandb and is_main_process():
                 wandb.log({"reward":ar,"kl_ref":kl,"group_reward_std":gs,"advantages_std":ast,"policy_loss":pl,"avg_response_len":al,"advantages_mean":am,"learning_rate":lr})
 
+        # 保存模型与断点续训信息
         if (step % args.save_interval == 0 or step == iters) and is_main_process():
             model.eval()
             moe_suffix = '_moe' if lm_config.use_moe else ''
@@ -359,17 +493,25 @@ def rl_train_epoch(epoch, loader, iters, rollout_engine, ref_model, reward_model
             model.train()
             del state_dict
 
-        if step % args.save_interval == 0 or step == iters: rollout_engine.update_policy(model)
+        # 如果 rollout 引擎是远端服务，则同步最新策略权重
+        if step % args.save_interval == 0 or step == iters:
+            rollout_engine.update_policy(model)
 
+        # 释放临时引用，减轻显存 / 内存压力
         del per_token_logps, ref_per_token_logps
         del completions, rewards, grouped_rewards, mean_r, std_r, advantages, completion_mask
 
+    # 如果最后一批没有凑满 accumulation_steps，则补做一次优化器更新
     if last_step > start_step and last_step % args.accumulation_steps != 0:
-        if args.grad_clip > 0: torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
-        optimizer.step(); scheduler.step(); optimizer.zero_grad()
+        if args.grad_clip > 0:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+        optimizer.step()
+        scheduler.step()
+        optimizer.zero_grad()
 
 
 if __name__ == "__main__":
+    # 命令行参数定义：控制训练、采样、奖励、分布式、wandb、SGLang 等行为。
     parser = argparse.ArgumentParser(description="MiniMind Agent RL")
     parser.add_argument("--save_dir", type=str, default="../out", help="模型保存目录")
     parser.add_argument('--save_weight', default='agent', type=str, help="保存权重名称")
@@ -410,19 +552,30 @@ if __name__ == "__main__":
     parser.add_argument("--sglang_shared_path", type=str, default="./sglang_ckpt_agent", help="SGLang共享存储路径")
     args = parser.parse_args()
 
+    # 初始化分布式环境，获取 local_rank，并将 device 绑定到对应 GPU
     local_rank = init_distributed_mode()
-    if dist.is_initialized(): args.device = f"cuda:{local_rank}"
+    if dist.is_initialized():
+        args.device = f"cuda:{local_rank}"
+
+    # 统一随机种子，便于复现实验
     setup_seed(42 + (dist.get_rank() if dist.is_initialized() else 0))
 
+    # 确保输出目录存在
     os.makedirs(args.save_dir, exist_ok=True)
+
+    # 构造模型配置：max_seq_len 这里要额外加上生成长度，便于完整容纳 prompt + response
     lm_config = MiniMindConfig(hidden_size=args.hidden_size, num_hidden_layers=args.num_hidden_layers,
                                max_seq_len=args.max_seq_len + args.max_gen_len, use_moe=bool(args.use_moe))
+
+    # 如果从 checkpoint 恢复，就先读回训练状态
     ckp_data = lm_checkpoint(lm_config, weight=args.save_weight, save_dir='../checkpoints') if args.from_resume == 1 else None
 
+    # 选择 device_type 与 autocast 类型
     device_type = "cuda" if "cuda" in args.device else "cpu"
     dtype = torch.bfloat16 if args.dtype == "bfloat16" else torch.float16
     autocast_ctx = nullcontext() if device_type == "cpu" else torch.cuda.amp.autocast(dtype=dtype)
 
+    # wandb / swanlab 的初始化只在主进程执行
     wandb = None
     if args.use_wandb and is_main_process():
         import swanlab as wandb
@@ -430,14 +583,18 @@ if __name__ == "__main__":
         resume = 'must' if wandb_id else None
         wandb.init(project=args.wandb_project, name=f"Agent-RL-E{args.epochs}-B{args.batch_size}-LR{args.learning_rate}", id=wandb_id, resume=resume)
 
+    # 初始化当前策略模型和 tokenizer
     model, tokenizer = init_model(lm_config, args.from_weight, device=args.device)
 
+    # 初始化一个参考模型，用于 KL 约束（训练时冻结）
     ref_model, _ = init_model(lm_config, args.from_weight, device=args.device)
     ref_model = ref_model.eval().requires_grad_(False)
 
+    # 加载 reward model，用于给无工具调用样本打分
     reward_model = LMForRewardModel(args.reward_model_path, device=args.device, dtype=torch.float16)
     Logger(f'Loaded reward model from {args.reward_model_path}')
-    # Rollout引擎
+
+    # 创建 rollout 引擎：可以是本地 torch，也可以是 SGLang HTTP 服务
     rollout_engine = create_rollout_engine(
         engine_type=args.rollout_engine,
         policy_model=model,
@@ -448,15 +605,25 @@ if __name__ == "__main__":
         sglang_model_path=args.sglang_model_path,
         sglang_shared_path=args.sglang_shared_path,
     )
+
+    # 读取 agent 强化学习数据集
     train_ds = AgentRLDataset(args.data_path, tokenizer, max_length=lm_config.max_seq_len)
     train_sampler = DistributedSampler(train_ds) if dist.is_initialized() else None
+
+    # 优化器与学习率调度器
     optimizer = optim.AdamW(model.parameters(), lr=args.learning_rate)
-    def collate_fn(batch): return {'messages': [b['messages'] for b in batch], 'tools': [b['tools'] for b in batch], 'gt': [b['gt'] for b in batch]}
+
+    # DataLoader 的 collate_fn 只负责按字段聚合，不做额外处理
+    def collate_fn(batch):
+        return {'messages': [b['messages'] for b in batch], 'tools': [b['tools'] for b in batch], 'gt': [b['gt'] for b in batch]}
+
+    # 先构造一个只用于统计长度的 loader
     loader_for_count = DataLoader(train_ds, batch_size=args.batch_size, sampler=train_sampler, collate_fn=collate_fn)
     iters = len(loader_for_count)
     total_optimizer_steps = math.ceil(iters / args.accumulation_steps) * args.epochs
     scheduler = CosineAnnealingLR(optimizer, T_max=total_optimizer_steps, eta_min=args.learning_rate / 10)
 
+    # 恢复训练状态
     start_epoch, start_step = 0, 0
     if ckp_data:
         model.load_state_dict(ckp_data['model'])
@@ -465,24 +632,32 @@ if __name__ == "__main__":
         start_epoch = ckp_data['epoch']
         start_step = ckp_data.get('step', 0)
 
+    # 可选 torch.compile
     if args.use_compile == 1:
         model = torch.compile(model)
         Logger('torch.compile enabled')
         rollout_engine.update_policy(model)
+
+    # DDP 包装
     if dist.is_initialized():
         model = DistributedDataParallel(model, device_ids=[local_rank])
     rollout_engine.update_policy(model)
 
+    # 主训练循环：按 epoch 跑强化学习更新
     for epoch in range(start_epoch, args.epochs):
         train_sampler and train_sampler.set_epoch(epoch)
-        setup_seed(42 + epoch); indices = torch.randperm(len(train_ds)).tolist()
+        setup_seed(42 + epoch)
+        indices = torch.randperm(len(train_ds)).tolist()
         skip = start_step if (epoch == start_epoch and start_step > 0) else 0
         batch_sampler = SkipBatchSampler(train_sampler or indices, args.batch_size, skip)
         loader = DataLoader(train_ds, batch_sampler=batch_sampler, num_workers=args.num_workers, pin_memory=True, collate_fn=collate_fn)
+
         if skip > 0:
             Logger(f'Epoch [{epoch+1}/{args.epochs}]: skip {start_step} steps')
-            rl_train_epoch(epoch, loader, len(loader) + skip, rollout_engine, ref_model, reward_model, start_step, wandb, use_sglang = (args.rollout_engine == "sglang"))
+            rl_train_epoch(epoch, loader, len(loader) + skip, rollout_engine, ref_model, reward_model, start_step, wandb, use_sglang=(args.rollout_engine == "sglang"))
         else:
-            rl_train_epoch(epoch, loader, len(loader), rollout_engine, ref_model, reward_model, 0, wandb, use_sglang = (args.rollout_engine == "sglang"))
+            rl_train_epoch(epoch, loader, len(loader), rollout_engine, ref_model, reward_model, 0, wandb, use_sglang=(args.rollout_engine == "sglang"))
 
-    if dist.is_initialized(): dist.destroy_process_group()
+    # DDP 结束时释放进程组
+    if dist.is_initialized():
+        dist.destroy_process_group()

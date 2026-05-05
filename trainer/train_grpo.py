@@ -1,6 +1,7 @@
 import os
 import sys
 
+# 把项目根目录加入模块搜索路径，保证 trainer 中可以直接导入 model / dataset / utils
 __package__ = "trainer"
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
@@ -24,16 +25,26 @@ from dataset.lm_dataset import RLAIFDataset
 from trainer.trainer_utils import Logger, is_main_process, lm_checkpoint, init_distributed_mode, setup_seed, SkipBatchSampler, init_model, LMForRewardModel
 from trainer.rollout_engine import create_rollout_engine
 
+# 屏蔽无关 warning，减少训练日志噪音
 warnings.filterwarnings('ignore')
 
 
 def rep_penalty(text, n=3, cap=0.5):
+    """计算重复 n-gram 惩罚，防止模型在 GRPO 中反复复读。"""
     toks = re.findall(r"\w+|[^\w\s]", text.lower())
     grams = [tuple(toks[i:i + n]) for i in range(len(toks) - n + 1)]
     return min(cap, (len(grams) - len(set(grams))) * cap * 2 / len(grams)) if grams else 0.0
 
 
 def calculate_rewards(prompts, responses, reward_model):
+    """为 GRPO 采样结果计算奖励。
+
+    奖励由三部分构成：
+    - 回复格式与长度奖励
+    - thinking 段落奖励
+    - reward model 打分
+    再减去重复惩罚。
+    """
     rewards = torch.zeros(len(responses), device=args.device)
 
     with torch.no_grad():
@@ -46,18 +57,26 @@ def calculate_rewards(prompts, responses, reward_model):
                 response = responses[response_idx]
                 prompt = prompts[i]
 
+                # 从 prompt 中恢复 messages，供 reward model 使用
                 pattern = r"<\|im_start\|>(system|user|assistant)\s+(.*?)<\|im_end\|>"
                 matches = re.findall(pattern, prompt, re.DOTALL)
                 messages = [{"role": role, "content": content.strip()} for role, content in matches]
                 answer = response
+
+                # 回复过短/过长都会扣分，鼓励中等长度输出
                 rewards[response_idx] += 0.5 if 20 <= len(response.strip()) <= 800 else -0.5
+
+                # 如果模型输出了 think 段，则对 think 的长度和闭合进行打分
                 if '</think>' in response:
                     thinking_content, answer_content = response.split('</think>', 1)
                     rewards[response_idx] += 1.0 if 20 <= len(thinking_content.strip()) <= 300 else -0.5
                     rewards[response_idx] += 0.25 if response.count('</think>') == 1 else -0.25
                     answer = answer_content.strip()
+
+                # 重复 n-gram 惩罚
                 rewards[response_idx] -= rep_penalty(answer)
 
+                # reward model 对最终回答再给一个语义分数
                 score = reward_model.get_score(messages, answer)
                 reward_model_scores.append(score)
 
@@ -68,14 +87,26 @@ def calculate_rewards(prompts, responses, reward_model):
 
 
 def grpo_train_epoch(epoch, loader, iters, rollout_engine, ref_model, reward_model, start_step=0, wandb=None, use_sglang=False):
+    """GRPO 训练的单个 epoch。
+
+    主要流程：
+    1. 对 prompt rollout 多个候选
+    2. 计算奖励并组内归一化成 advantage
+    3. 计算 token-level policy loss + KL 正则
+    """
     for step, batch in enumerate(loader, start=start_step + 1):
+        # batch 中只有 prompt 文本
         prompts = batch['prompt']  # list[str], length B
+
+        # 使用 tokenizer 将 prompt 编码，并且左填充以适配自回归生成
         prompt_inputs = tokenizer(prompts, return_tensors="pt", padding=True, return_token_type_ids=False,
                                   padding_side="left", add_special_tokens=False).to(args.device)
         if args.max_seq_len:
+            # 截断到最大 prompt 长度，避免上下文过长
             prompt_inputs["input_ids"] = prompt_inputs["input_ids"][:, -args.max_seq_len:]
             prompt_inputs["attention_mask"] = prompt_inputs["attention_mask"][:, -args.max_seq_len:]
 
+        # rollout 引擎一次生成 num_generations 条候选
         rollout_result = rollout_engine.rollout(
             prompt_ids=prompt_inputs["input_ids"],
             attention_mask=prompt_inputs["attention_mask"],
@@ -83,24 +114,33 @@ def grpo_train_epoch(epoch, loader, iters, rollout_engine, ref_model, reward_mod
             max_new_tokens=args.max_gen_len,
             temperature=0.8,
         )
+
+        # rollout_result 中包含完整输出、completion 切片、旧 logprob 等信息
         outputs = rollout_result.output_ids
         completion_ids = rollout_result.completion_ids
         completions = rollout_result.completions
         old_per_token_logps = rollout_result.per_token_logps.to(args.device)
         prompt_lens = rollout_result.prompt_lens.to(args.device)
         full_mask = (outputs != tokenizer.pad_token_id).long()
+
+        # logp_pos 指向 completion 在完整序列中的 token 位置
         logp_pos = prompt_lens.unsqueeze(1) - 1 + torch.arange(completion_ids.size(1), device=args.device).unsqueeze(0)
 
+        # 当前策略模型前向，计算新 logprob 和 MoE aux loss
         model_unwrapped = model.module if isinstance(model, DistributedDataParallel) else model
         with autocast_ctx:
             res = model_unwrapped(outputs, attention_mask=full_mask)
             aux_loss = res.aux_loss if lm_config.use_moe else torch.tensor(0.0, device=args.device)
             per_token_logps = F.log_softmax(res.logits[:, :-1, :], dim=-1).gather(2, outputs[:, 1:].unsqueeze(-1)).squeeze(-1).gather(1, logp_pos)
-        
+
+        # 参考模型的 logprob 用于 KL 惩罚
         with torch.no_grad():
             ref_per_token_logps = F.log_softmax(ref_model(outputs, attention_mask=full_mask).logits[:, :-1, :], dim=-1).gather(2, outputs[:, 1:].unsqueeze(-1)).squeeze(-1).gather(1, logp_pos)
+
+        # 对所有候选计算 reward
         rewards = calculate_rewards(prompts, completions, reward_model).to(args.device)  # [B*num_gen]
 
+        # 调试模式下打印样本级详细信息，方便检查 reward 与输出
         if args.debug_mode and is_main_process() and step % args.debug_interval == 0:
             for i in range(len(prompts)):
                 Logger(f"[DEBUG] step={step}, sample[{i}]")
@@ -116,20 +156,25 @@ def grpo_train_epoch(epoch, loader, iters, rollout_engine, ref_model, reward_mod
                     Logger(f"[DEBUG] gen[{j}] reward={rewards[idx].item():.4f}")
                 Logger('='*100)
 
+        # 组内标准化：同一个 prompt 的多个候选之间做相对比较
         grouped_rewards = rewards.view(-1, args.num_generations)  # [B, num_gen]
         mean_r = grouped_rewards.mean(dim=1).repeat_interleave(args.num_generations)  # [B*num_gen]
         std_r = grouped_rewards.std(dim=1, unbiased=False).repeat_interleave(args.num_generations)  # [B*num_gen]
         advantages = (rewards - mean_r) / (std_r + 1e-4)  # [B*num_gen]
 
+        # completion mask：只计算真正 completion token 的 loss
         completion_pad_mask = rollout_result.completion_mask.to(args.device).bool()
         is_eos = (completion_ids == tokenizer.eos_token_id) & completion_pad_mask  # [B*num_gen, R]
         eos_idx = torch.full((is_eos.size(0),), is_eos.size(1) - 1, dtype=torch.long, device=args.device)
         eos_idx[is_eos.any(dim=1)] = is_eos.int().argmax(dim=1)[is_eos.any(dim=1)]
         completion_mask = ((torch.arange(is_eos.size(1), device=args.device).expand(is_eos.size(0), -1) <= eos_idx.unsqueeze(1)) & completion_pad_mask).int()  # [B*num_gen, R]
 
+        # KL 与 policy ratio 相关项
         kl_div = ref_per_token_logps - per_token_logps
         per_token_kl = torch.exp(kl_div) - kl_div - 1  # [B*num_gen, R]
         ratio = torch.exp(per_token_logps - old_per_token_logps)  # [B*num_gen, R]
+
+        # 根据 loss_type 选择 GRPO/CISPO 风格的策略损失
         if args.loss_type == "cispo":
             clamped_ratio = torch.clamp(ratio, max=args.epsilon_high).detach()
             per_token_loss = -(clamped_ratio * advantages.unsqueeze(1) * per_token_logps - args.beta * per_token_kl)
@@ -138,10 +183,13 @@ def grpo_train_epoch(epoch, loader, iters, rollout_engine, ref_model, reward_mod
             per_token_loss1 = ratio * advantages.unsqueeze(1)
             per_token_loss2 = clipped_ratio * advantages.unsqueeze(1)
             per_token_loss = -(torch.min(per_token_loss1, per_token_loss2) - args.beta * per_token_kl)
+
+        # 对每条 response 的有效 token 求平均，再在 batch 上取均值
         policy_loss = ((per_token_loss * completion_mask).sum(dim=1) / completion_mask.sum(dim=1).clamp(min=1)).mean()
         loss = (policy_loss + aux_loss) / args.accumulation_steps  # scalar
         loss.backward()
 
+        # 梯度累积到设定步数后更新参数
         if step % args.accumulation_steps == 0:
             if args.grad_clip > 0:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
@@ -149,6 +197,7 @@ def grpo_train_epoch(epoch, loader, iters, rollout_engine, ref_model, reward_mod
             scheduler.step()
             optimizer.zero_grad()
 
+        # ===== 日志 =====
         if step % args.log_interval == 0 or step == iters:
             policy_loss_val = loss.item() * args.accumulation_steps
             current_aux_loss = aux_loss.item()
@@ -175,6 +224,7 @@ def grpo_train_epoch(epoch, loader, iters, rollout_engine, ref_model, reward_mod
                     "learning_rate": current_lr
                 })
 
+        # ===== 保存 checkpoint 与同步 rollout 服务权重 =====
         if (step % args.save_interval == 0 or step == iters) and is_main_process():
             model.eval()
             moe_suffix = '_moe' if lm_config.use_moe else ''
@@ -183,16 +233,19 @@ def grpo_train_epoch(epoch, loader, iters, rollout_engine, ref_model, reward_mod
             raw_model = getattr(raw_model, '_orig_mod', raw_model)
             state_dict = raw_model.state_dict()
             torch.save({k: v.half().cpu() for k, v in state_dict.items()}, ckp)
-            lm_checkpoint(lm_config, weight=args.save_weight, model=model, optimizer=optimizer, 
+            lm_checkpoint(lm_config, weight=args.save_weight, model=model, optimizer=optimizer,
                          epoch=epoch, step=step, wandb=wandb, save_dir='../checkpoints', scheduler=scheduler)
             model.train()
             del state_dict
 
-        if step % args.save_interval == 0 or step == iters: rollout_engine.update_policy(model)
+        if step % args.save_interval == 0 or step == iters:
+            rollout_engine.update_policy(model)
 
+        # 删除临时变量，避免长训练过程里的显存/内存碎片累积
         del prompt_inputs, outputs, completion_ids, per_token_logps, ref_per_token_logps
         del completions, rewards, grouped_rewards, mean_r, std_r, advantages, completion_mask, completion_pad_mask, prompt_lens, logp_pos
 
+    # 如果最后一个 batch 没有触发 accumulation，这里补一次参数更新
     if step > start_step and step % args.accumulation_steps != 0:
         if args.grad_clip > 0:
             torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
@@ -202,6 +255,7 @@ def grpo_train_epoch(epoch, loader, iters, rollout_engine, ref_model, reward_mod
 
 
 if __name__ == "__main__":
+    # GRPO 训练入口参数
     parser = argparse.ArgumentParser(description="MiniMind GRPO (Group Relative Policy Optimization)")
     parser.add_argument("--save_dir", type=str, default="../out", help="模型保存目录")
     parser.add_argument('--save_weight', default='grpo', type=str, help="保存权重的前缀名")
@@ -243,21 +297,22 @@ if __name__ == "__main__":
 
     # ========== 1. 初始化环境和随机种子 ==========
     local_rank = init_distributed_mode()
-    if dist.is_initialized(): args.device = f"cuda:{local_rank}"
+    if dist.is_initialized():
+        args.device = f"cuda:{local_rank}"
     setup_seed(42 + (dist.get_rank() if dist.is_initialized() else 0))
-    
+
     # ========== 2. 配置目录、模型参数、检查ckp ==========
     os.makedirs(args.save_dir, exist_ok=True)
     lm_config = MiniMindConfig(hidden_size=args.hidden_size, num_hidden_layers=args.num_hidden_layers,
                                max_seq_len=args.max_seq_len + args.max_gen_len, use_moe=bool(args.use_moe))
-    ckp_data = lm_checkpoint(lm_config, weight=args.save_weight, save_dir='../checkpoints') if args.from_resume==1 else None
-    
+    ckp_data = lm_checkpoint(lm_config, weight=args.save_weight, save_dir='../checkpoints') if args.from_resume == 1 else None
+
     # ========== 3. 设置混合精度 ==========
     device_type = "cuda" if "cuda" in args.device else "cpu"
     dtype = torch.bfloat16 if args.dtype == "bfloat16" else torch.float16
     autocast_ctx = nullcontext() if device_type == "cpu" else torch.cuda.amp.autocast(dtype=dtype)
-    
-    # ========== 4. 配wandb ==========
+
+    # ========== 4. 配 wandb ==========
     wandb = None
     if args.use_wandb and is_main_process():
         import swanlab as wandb
@@ -265,17 +320,17 @@ if __name__ == "__main__":
         resume = 'must' if wandb_id else None
         wandb_run_name = f"MiniMind-GRPO-Epoch-{args.epochs}-BS-{args.batch_size}-LR-{args.learning_rate}"
         wandb.init(project=args.wandb_project, name=wandb_run_name, id=wandb_id, resume=resume)
-    
+
     # ========== 5. 初始化模型和数据 ==========
     base_weight = args.from_weight
-    # Policy模型
+    # Policy 模型负责生成样本并更新策略
     model, tokenizer = init_model(lm_config, base_weight, device=args.device)
-    # Reference模型
+    # Reference 模型用于 KL 约束，冻结不训练
     ref_model, _ = init_model(lm_config, base_weight, device=args.device)
     ref_model = ref_model.eval().requires_grad_(False)
-    # Reward模型
+    # Reward 模型为生成结果打分
     reward_model = LMForRewardModel(args.reward_model_path, device=args.device, dtype=torch.float16)
-    # Rollout引擎（可插拔替换，只负责 policy 推理）
+    # Rollout 引擎可选本地 torch 或 SGLang 远端服务
     rollout_engine = create_rollout_engine(
         engine_type=args.rollout_engine,
         policy_model=model,
@@ -286,7 +341,7 @@ if __name__ == "__main__":
         sglang_model_path=args.sglang_model_path,
         sglang_shared_path=args.sglang_shared_path,
     )
-    # 数据和优化器
+    # 数据集与优化器
     train_ds = RLAIFDataset(args.data_path, tokenizer, max_length=lm_config.max_seq_len, thinking_ratio=args.thinking_ratio)
     train_sampler = DistributedSampler(train_ds) if dist.is_initialized() else None
     optimizer = optim.AdamW(model.parameters(), lr=args.learning_rate)
@@ -294,7 +349,7 @@ if __name__ == "__main__":
     iters = len(loader_for_count)
     total_optimizer_steps = math.ceil(iters / args.accumulation_steps) * args.epochs
     scheduler = CosineAnnealingLR(optimizer, T_max=total_optimizer_steps, eta_min=args.learning_rate / 10)
-    
+
     # ========== 6. 从ckp恢复状态 ==========
     start_epoch, start_step = 0, 0
     if ckp_data:
@@ -303,7 +358,7 @@ if __name__ == "__main__":
         scheduler.load_state_dict(ckp_data['scheduler'])
         start_epoch = ckp_data['epoch']
         start_step = ckp_data.get('step', 0)
-    
+
     # ========== 7. 编译和分布式包装 ==========
     if args.use_compile == 1:
         model = torch.compile(model)
@@ -312,19 +367,21 @@ if __name__ == "__main__":
     if dist.is_initialized():
         model = DistributedDataParallel(model, device_ids=[local_rank])
     rollout_engine.update_policy(model)
-    
+
     # ========== 8. 开始训练 ==========
     for epoch in range(start_epoch, args.epochs):
         train_sampler and train_sampler.set_epoch(epoch)
-        setup_seed(42 + epoch); indices = torch.randperm(len(train_ds)).tolist()
+        setup_seed(42 + epoch)
+        indices = torch.randperm(len(train_ds)).tolist()
         skip = start_step if (epoch == start_epoch and start_step > 0) else 0
         batch_sampler = SkipBatchSampler(train_sampler or indices, args.batch_size, skip)
         loader = DataLoader(train_ds, batch_sampler=batch_sampler, num_workers=args.num_workers, pin_memory=True)
-        if skip > 0: 
+        if skip > 0:
             Logger(f'Epoch [{epoch + 1}/{args.epochs}]: 跳过前{start_step}个step，从step {start_step + 1}开始')
-            grpo_train_epoch(epoch, loader, len(loader) + skip, rollout_engine, ref_model, reward_model, start_step, wandb, use_sglang = (args.rollout_engine == "sglang"))
+            grpo_train_epoch(epoch, loader, len(loader) + skip, rollout_engine, ref_model, reward_model, start_step, wandb, use_sglang=(args.rollout_engine == "sglang"))
         else:
-            grpo_train_epoch(epoch, loader, len(loader), rollout_engine, ref_model, reward_model, 0, wandb, use_sglang = (args.rollout_engine == "sglang"))
-    
+            grpo_train_epoch(epoch, loader, len(loader), rollout_engine, ref_model, reward_model, 0, wandb, use_sglang=(args.rollout_engine == "sglang"))
+
     # ========== 9. 清理分布进程 ==========
-    if dist.is_initialized(): dist.destroy_process_group()
+    if dist.is_initialized():
+        dist.destroy_process_group()
